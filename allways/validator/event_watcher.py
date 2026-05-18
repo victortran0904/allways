@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import bittensor as bt
 
 from allways.classes import SwapStatus
+from allways.commitments import read_miner_commitment
 from allways.constants import SCORING_WINDOW_BLOCKS
 from allways.utils.scale import (
     decode_account_id,
@@ -31,7 +32,7 @@ from allways.utils.scale import (
     decode_u128,
     strip_hex_prefix,
 )
-from allways.validator.state_store import ValidatorStateStore
+from allways.validator.state_store import ReservationPin, ValidatorStateStore
 from allways.validator.swap_tracker import SwapTracker
 
 DATA_DECODERS = {
@@ -209,10 +210,20 @@ class ContractEventWatcher:
         metadata_path: Path,
         state_store: ValidatorStateStore,
         swap_tracker: Optional[SwapTracker] = None,
+        *,
+        netuid: Optional[int] = None,
+        subtensor: Any = None,
     ):
         self.substrate = substrate
         self.contract_address = contract_address
         self.state_store = state_store
+        # netuid + subtensor are needed to pin a miner's commitment at the
+        # reservation block — ``read_miner_commitment`` calls
+        # ``subtensor.determine_block_hash``, which the bare ``substrate``
+        # lacks. When absent (e.g. the unit-test helper) the MinerReserved
+        # handler no-ops, so the watcher still works without them.
+        self.netuid = netuid
+        self.subtensor = subtensor
         # Late-bindable so the validator can construct the tracker after the
         # watcher (cycle in current init order). Timeout extension finalize
         # writes are skipped until this is set.
@@ -410,10 +421,19 @@ class ContractEventWatcher:
                 return
             active = bool(values.get('active'))
             self.record_active_transition(block_num, hotkey, active)
+        elif name == 'MinerReserved':
+            miner = values.get('miner', '')
+            reserved_until = values.get('reserved_until')
+            if miner and isinstance(reserved_until, int):
+                self.record_reservation_pin(block_num, miner, reserved_until)
         elif name == 'SwapInitiated':
             swap_id = values.get('swap_id')
             miner = values.get('miner', '')
             if miner:
+                # The reservation has now become a swap — its commitment
+                # snapshot is captured in the on-chain swap struct, so the
+                # local pin is no longer needed.
+                self.state_store.remove_reservation_pin(miner)
                 # Skip if this swap's +1 was already seeded from the contract's
                 # live active-swap list at bootstrap — otherwise a restart
                 # whose replay window covers the original SwapInitiated would
@@ -446,6 +466,9 @@ class ContractEventWatcher:
                     completed=False,
                     resolved_block=block_num,
                 )
+                # Defensive: a SwapInitiated this validator missed would leave
+                # a stale pin behind — clear it on the terminal event too.
+                self.state_store.remove_reservation_pin(miner)
                 self.apply_busy_delta(block_num, miner, -1)
                 self.bootstrapped_swap_ids.discard(swap_id)
                 if self.swap_tracker is not None:
@@ -460,11 +483,71 @@ class ContractEventWatcher:
             applied_target = values.get('applied_target')
             if miner and isinstance(applied_target, int):
                 self.state_store.update_reserved_until(miner, applied_target)
+                # Keep the pin's TTL in step so purge_expired_reservation_pins
+                # doesn't drop a still-live pin at its stale deadline.
+                self.state_store.update_reservation_pin_reserved_until(miner, applied_target)
         elif name == 'TimeoutExtensionFinalized':
             swap_id = values.get('swap_id')
             applied_target = values.get('applied_target')
             if self.swap_tracker is not None and isinstance(swap_id, int) and isinstance(applied_target, int):
                 self.swap_tracker.update_timeout_block(swap_id, applied_target)
+
+    def record_reservation_pin(self, block_num: int, miner: str, reserved_until: int) -> None:
+        """Pin the miner's commitment as of the reservation block ``block_num``.
+
+        ``handle_swap_confirm`` later resolves the swap's rate + addresses from
+        this pin instead of the miner's live commitment, closing the window in
+        which a miner could move its rate or deposit address after the user
+        reserved. The read is at the canonical block ``block_num`` so every
+        validator derives a byte-identical pin.
+
+        On any failure — a transient RPC error, a pruned block during backfill,
+        or a missing commitment — no pin is written: a validator with no pin
+        falls back to the live commitment in ``handle_swap_confirm``, but a
+        validator must never persist a *wrong* pin.
+        """
+        if self.subtensor is None or self.netuid is None:
+            bt.logging.debug(
+                f'EventWatcher: MinerReserved for {miner[:8]} at block {block_num} — '
+                'no subtensor/netuid wired, skipping reservation pin'
+            )
+            return
+        try:
+            commitment = read_miner_commitment(
+                subtensor=self.subtensor,
+                netuid=self.netuid,
+                hotkey=miner,
+                block=block_num,
+            )
+        except Exception as e:
+            bt.logging.warning(
+                f'EventWatcher: reservation pin commitment read failed for '
+                f'{miner[:8]} at block {block_num}: {e} — no pin written, will fall back'
+            )
+            return
+        if commitment is None:
+            bt.logging.warning(
+                f'EventWatcher: no commitment for {miner[:8]} at reservation block '
+                f'{block_num} — no pin written, will fall back'
+            )
+            return
+        self.state_store.upsert_reservation_pin(
+            ReservationPin(
+                miner_hotkey=miner,
+                reserve_block=block_num,
+                from_chain=commitment.from_chain,
+                to_chain=commitment.to_chain,
+                rate_str=commitment.rate_str,
+                counter_rate_str=commitment.counter_rate_str,
+                miner_from_address=commitment.from_address,
+                miner_to_address=commitment.to_address,
+                reserved_until=reserved_until,
+            )
+        )
+        bt.logging.info(
+            f'EventWatcher: pinned reservation for {miner[:8]} at block {block_num} '
+            f'({commitment.from_chain}->{commitment.to_chain})'
+        )
 
     def record_active_transition(self, block_num: int, hotkey: str, active: bool) -> None:
         """Apply an on-chain active-flag transition to both the current-state

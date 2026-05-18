@@ -108,6 +108,8 @@ class Validator(BaseValidatorNeuron):
             contract_address=self.contract_client.contract_address,
             metadata_path=metadata_path,
             state_store=self.state_store,
+            netuid=self.config.netuid,
+            subtensor=self.subtensor,
         )
         self.event_watcher.initialize(
             current_block=self.block,

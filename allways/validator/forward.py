@@ -72,6 +72,13 @@ async def forward(self: Validator) -> None:
     await tracker.poll()
     bt.logging.info('forward: tracker polled')
 
+    # Snapshot the dest-chain tip on first sighting of each swap so a later
+    # miner-supplied dest tx can be rejected if its block predates the snapshot
+    # (replay defense). Prune stops the per-swap dicts from growing forever.
+    for swap in tracker.active.values():
+        verifier.observe_initiation(swap)
+    verifier.prune_to_active(set(tracker.active.keys()))
+
     # Verify FULFILLED swaps end-to-end and vote confirm_swap. The returned
     # set is swap IDs where the provider was unreachable this cycle, so the
     # timeout phase knows to skip them (transient outage shouldn't slash).

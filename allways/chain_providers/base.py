@@ -122,6 +122,16 @@ class ChainProvider(ABC):
         return tx_info
 
     @abstractmethod
+    def get_current_block_height(self) -> Optional[int]:
+        """Chain tip block height. None on transient backend failure.
+
+        Used by the validator to snapshot the dest chain's tip at swap
+        initiation so a later miner-supplied dest tx can be rejected as a
+        replay if its block predates the snapshot.
+        """
+        ...
+
+    @abstractmethod
     def get_balance(self, address: str) -> int: ...
 
     @abstractmethod

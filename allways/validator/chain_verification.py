@@ -22,12 +22,9 @@ class SwapVerifier:
     Rate and miner source address are stored on the swap struct at initiation,
     so verification is self-contained — no commitment lookup needed.
 
-    Dest-tx replay defense: on first observation of a swap, the validator
-    snapshots the dest chain's current tip. A miner-supplied dest tx must
-    be mined at or after that snapshot, otherwise it's a recycled hash from
-    an older swap. A contract-level ``used_to_tx`` mirror of ``used_from_tx``
-    would be stronger but requires a contract upgrade; this validator-side
-    check ships the same protection without one.
+    Dest-tx replay defense: snapshots the dest chain's tip on first sighting
+    of a swap and rejects later dest txs whose block predates the snapshot —
+    a validator-side stand-in for a contract-level ``used_to_tx`` mirror.
     """
 
     def __init__(
@@ -39,36 +36,30 @@ class SwapVerifier:
         self.fee_divisor = fee_divisor
         self.last_logged_confs: Dict[str, int] = {}  # swap_id:chain -> confs
         self.source_verified_ids: Set[int] = set()  # source tx is final once confirmed
-        # swap_id -> dest-chain block height observed at first sighting.
-        # Absent = no snapshot yet (fail-open with a one-time warning).
-        # TAO-dest swaps don't go in here — they use swap.initiated_block directly.
-        self.dest_tip_at_init: Dict[int, int] = {}
+        self.dest_tip_at_init: Dict[int, int] = {}  # swap_id -> dest tip at first sighting (non-TAO only)
 
     def observe_initiation(self, swap: Swap) -> None:
-        """Snapshot the dest chain's tip the first time a non-TAO-dest swap appears.
-
-        Idempotent. Silently retries next forward step on transient provider
-        failure (single warning emitted via ``log_on_change``).
-        """
+        """Snapshot the dest chain's tip on first sighting of a non-TAO swap.
+        Idempotent; fails open with a one-time warning on RPC error."""
         if swap.to_chain == 'tao' or swap.id in self.dest_tip_at_init:
             return
         provider = self.providers.get(swap.to_chain)
         if provider is None:
             return
+        # Broad except (vs verify_tx's re-raise of ProviderUnreachableError):
+        # this runs inside a forward-loop iteration and must not break it.
         try:
             tip = provider.get_current_block_height()
-        except Exception as e:
+        except Exception:
             tip = None
-            bt.logging.debug(f'Swap {swap.id}: dest-tip snapshot raised {type(e).__name__}: {e}')
-        if tip is None or tip <= 0:
+        if tip and tip > 0:
+            self.dest_tip_at_init[swap.id] = tip - DEST_TIP_SNAPSHOT_GRACE
+        else:
             log_on_change(
                 f'snapshot_unavailable:{swap.id}',
                 True,
-                f'Swap {swap.id}: dest-tip snapshot unavailable on {swap.to_chain} — '
-                f'replay defense disabled until snapshot succeeds',
+                f'Swap {swap.id}: dest-tip snapshot failed on {swap.to_chain} — replay defense off until retry',
             )
-            return
-        self.dest_tip_at_init[swap.id] = tip - DEST_TIP_SNAPSHOT_GRACE
 
     def prune_to_active(self, active_ids: Set[int]) -> None:
         """Drop per-swap state for swaps no longer being tracked."""
@@ -131,12 +122,7 @@ class SwapVerifier:
             return True
         lower = swap.initiated_block if swap.to_chain == 'tao' else self.dest_tip_at_init.get(swap.id)
         if lower is None:
-            log_on_change(
-                f'snapshot_failopen:{swap.id}',
-                True,
-                f'Swap {swap.id}: no dest-tip snapshot — replay defense skipped (fail-open)',
-            )
-            return True
+            return True  # fail-open; observe_initiation already logged
         if dest_info.block_number < lower:
             bt.logging.warning(
                 f'Swap {swap.id}: dest tx at block {dest_info.block_number} < initiated {lower} — '

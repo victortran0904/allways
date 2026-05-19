@@ -123,12 +123,7 @@ class ChainProvider(ABC):
 
     @abstractmethod
     def get_current_block_height(self) -> Optional[int]:
-        """Chain tip block height. None on transient backend failure.
-
-        Used by the validator to snapshot the dest chain's tip at swap
-        initiation so a later miner-supplied dest tx can be rejected as a
-        replay if its block predates the snapshot.
-        """
+        """Chain tip block height. None on transient backend failure."""
         ...
 
     @abstractmethod

@@ -72,9 +72,7 @@ async def forward(self: Validator) -> None:
     await tracker.poll()
     bt.logging.info('forward: tracker polled')
 
-    # Snapshot the dest-chain tip on first sighting of each swap so a later
-    # miner-supplied dest tx can be rejected if its block predates the snapshot
-    # (replay defense). Prune stops the per-swap dicts from growing forever.
+    # Snapshot dest-chain tip on first sighting for the dest-tx replay defense.
     for swap in tracker.active.values():
         verifier.observe_initiation(swap)
     verifier.prune_to_active(set(tracker.active.keys()))
